@@ -1,30 +1,40 @@
 import numpy as np
 import onnx
 import torch
+import torch.nn as nn
+
+from backbones import *
 
 
-def convert_onnx(net, path_module, output, opset=11, simplify=False):
+def convert_onnx(net, path_module, output, opset=11, simplify=True, reparameter=True):
     assert isinstance(net, torch.nn.Module)
     img = np.random.randint(0, 255, size=(112, 112, 3), dtype=np.int32)
-    img = img.astype(np.float)
+    img = img.astype(float)
     img = (img / 255. - 0.5) / 0.5  # torch style norm
     img = img.transpose((2, 0, 1))
     img = torch.from_numpy(img).unsqueeze(0).float()
 
     weight = torch.load(path_module)
     net.load_state_dict(weight, strict=True)
+
+    if reparameter:
+        for layer in net.modules():
+            if isinstance(layer, MobileOneBlock):
+                layer.switch_to_deploy()
+
     net.eval()
-    torch.onnx.export(net, img, output, input_names=["data"], keep_initializers_as_inputs=False, verbose=False, opset_version=opset)
+    torch.onnx.export(net, img, output, input_names=["data"], keep_initializers_as_inputs=False, verbose=False,
+                      opset_version=opset)
     model = onnx.load(output)
     graph = model.graph
     graph.input[0].type.tensor_type.shape.dim[0].dim_param = 'None'
     if simplify:
         from onnxsim import simplify
-        model, check = simplify(model)
+        model, check = simplify(model, input_shapes={"data": [1, 3, 112, 112]})
         assert check, "Simplified ONNX model could not be validated"
     onnx.save(model, output)
 
-    
+
 if __name__ == '__main__':
     import os
     import argparse
@@ -34,7 +44,8 @@ if __name__ == '__main__':
     parser.add_argument('input', type=str, help='input backbone.pth file or path')
     parser.add_argument('--output', type=str, default=None, help='output onnx path')
     parser.add_argument('--network', type=str, default=None, help='backbone network')
-    parser.add_argument('--simplify', type=bool, default=False, help='onnx simplify')
+    parser.add_argument('--simplify', type=bool, default=True, help='onnx simplify')
+    parser.add_argument('--reparameter', type=bool, default=True, help='model reparameterization')
     args = parser.parse_args()
     input_file = args.input
     if os.path.isdir(input_file):
@@ -50,4 +61,4 @@ if __name__ == '__main__':
     backbone_onnx = get_model(args.network, dropout=0.0, fp16=False, num_features=512)
     if args.output is None:
         args.output = os.path.join(os.path.dirname(args.input), "model.onnx")
-    convert_onnx(backbone_onnx, input_file, args.output, simplify=args.simplify)
+    convert_onnx(backbone_onnx, input_file, args.output, simplify=args.simplify, reparameter=args.reparameter)

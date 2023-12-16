@@ -5,15 +5,17 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.nn import MSELoss
 from backbones import get_model
-from dataset_aug import get_dataloader
+from dataset import get_dataloader
 from losses import CombinedMarginLoss
 from lr_scheduler import PolynomialLRWarmup
 from partial_fc_v2 import PartialFC_V2
 from torch import distributed
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from utils.utils_callbacks import CallBackLogging, CallBackVerification
+from utils.utils_callbacks import CallBackLogging, CallBackVerification, CallBackLoggingKD
 from utils.utils_config import get_config
 from utils.utils_distributed_sampler import setup_seed
 from utils.utils_logging import AverageMeter, init_logging
@@ -33,14 +35,13 @@ except KeyError:
     world_size = 1
     distributed.init_process_group(
         backend="nccl",
-        init_method="tcp://127.0.0.1:12585",
+        init_method="tcp://127.0.0.1:12584",
         rank=rank,
         world_size=world_size,
     )
 
 
 def main(args):
-
     # get config
     cfg = get_config(args.config)
     # global control random seed
@@ -56,7 +57,7 @@ def main(args):
         if rank == 0
         else None
     )
-    
+
     wandb_logger = None
     if cfg.using_wandb:
         import wandb
@@ -71,12 +72,12 @@ def main(args):
         run_name = run_name if cfg.suffix_run_name is None else run_name + f"_{cfg.suffix_run_name}"
         try:
             wandb_logger = wandb.init(
-                entity = cfg.wandb_entity, 
-                project = cfg.wandb_project, 
-                sync_tensorboard = True,
+                entity=cfg.wandb_entity,
+                project=cfg.wandb_project,
+                sync_tensorboard=True,
                 resume=cfg.wandb_resume,
-                name = run_name, 
-                notes = cfg.notes) if rank == 0 or cfg.wandb_log_all else None
+                name=run_name,
+                notes=cfg.notes) if rank == 0 or cfg.wandb_log_all else None
             if wandb_logger:
                 wandb_logger.config.update(cfg)
         except Exception as e:
@@ -89,12 +90,7 @@ def main(args):
         cfg.dali,
         cfg.dali_aug,
         cfg.seed,
-        cfg.num_workers,
-        cfg.aug_pipeline,
-        cfg.add_rec,
-        cfg.keep_max_yaw_val,
-        cfg.keep_max_pitch_val,
-        cfg.keep_max_yaw_and_pitch_val,
+        cfg.num_workers
     )
 
     backbone = get_model(
@@ -120,6 +116,7 @@ def main(args):
         cfg.margin_list[2],
         cfg.interclass_filtering_threshold
     )
+    kd_loss = MSELoss()
 
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
@@ -142,7 +139,6 @@ def main(args):
     else:
         raise
 
-    cfg.num_image = len(train_loader.dataset)   # change the total number of images
     cfg.total_batch_size = cfg.batch_size * world_size
     cfg.warmup_step = cfg.num_image // cfg.total_batch_size * cfg.warmup_epoch
     cfg.total_step = cfg.num_image // cfg.total_batch_size * cfg.num_epoch
@@ -154,11 +150,6 @@ def main(args):
 
     start_epoch = 0
     global_step = 0
-    if cfg.load_from:
-        pretrain_checkpoint = torch.load(os.path.join(cfg.load_from, f"checkpoint_gpu_{rank}.pt"))
-        backbone.module.load_state_dict(pretrain_checkpoint["state_dict_backbone"])
-        module_partial_fc.load_state_dict(pretrain_checkpoint["state_dict_softmax_fc"])
-        print("success load pretrain model from {}".format(cfg.load_from))
     if cfg.resume:
         dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
         start_epoch = dict_checkpoint["epoch"]
@@ -174,31 +165,56 @@ def main(args):
         logging.info(": " + key + " " * num_space + str(value))
 
     callback_verification = CallBackVerification(
-        val_targets=cfg.val_targets, rec_prefix=cfg.rec, 
-        summary_writer=summary_writer, wandb_logger = wandb_logger
+        val_targets=cfg.val_targets, rec_prefix=cfg.rec,
+        summary_writer=summary_writer, wandb_logger=wandb_logger
     )
-    callback_logging = CallBackLogging(
+    callback_logging = CallBackLoggingKD(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
         batch_size=cfg.batch_size,
-        start_step = global_step,
+        start_step=global_step,
         writer=summary_writer
     )
 
-    loss_am = AverageMeter()
+    loss = AverageMeter()
+    loss1 = AverageMeter()
+    loss2 = AverageMeter()
     amp = torch.cuda.amp.grad_scaler.GradScaler(growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
+
+        backbone_teacher = get_model(
+            cfg.teacher_network, dropout=0.0, num_features=cfg.embedding_size).cuda()
+        try:
+            backbone_teacher_pth = os.path.join(cfg.teacher_pth, f"epoch_{epoch+1}.pt")
+            backbone_teacher.load_state_dict(torch.load(backbone_teacher_pth, map_location=torch.device(local_rank)))
+
+            if rank == 0:
+                logging.info("backbone teacher loaded for epoch {} successfully!".format(epoch))
+        except (FileNotFoundError, KeyError, IndexError, RuntimeError) as e:
+            logging.info("load teacher backbone for epoch {} init, failed!".format(epoch))
+            raise e
+
+        backbone_teacher = torch.nn.parallel.DistributedDataParallel(
+            module=backbone_teacher, broadcast_buffers=False, device_ids=[local_rank], bucket_cap_mb=16,
+            find_unused_parameters=True)
+        backbone_teacher.eval()
 
         if isinstance(train_loader, DataLoader):
             train_loader.sampler.set_epoch(epoch)
         for _, (img, local_labels) in enumerate(train_loader):
             global_step += 1
+
+            with torch.no_grad():
+                teacher_embeddings = F.normalize(backbone_teacher(img))
             local_embeddings = backbone(img)
-            loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels)
+            loss_v1: torch.Tensor = module_partial_fc(local_embeddings, local_labels)
+            student_embeddings = F.normalize(local_embeddings)
+            loss_v2 = cfg.w * kd_loss(student_embeddings, teacher_embeddings)
+            loss_v = loss_v1 + loss_v2
 
             if cfg.fp16:
-                amp.scale(loss).backward()
+                amp.scale(loss_v).backward()
                 if global_step % cfg.gradient_acc == 0:
                     amp.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
@@ -206,7 +222,7 @@ def main(args):
                     amp.update()
                     opt.zero_grad()
             else:
-                loss.backward()
+                loss_v.backward()
                 if global_step % cfg.gradient_acc == 0:
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     opt.step()
@@ -216,14 +232,16 @@ def main(args):
             with torch.no_grad():
                 if wandb_logger:
                     wandb_logger.log({
-                        'Loss/Step Loss': loss.item(),
-                        'Loss/Train Loss': loss_am.avg,
+                        'Loss/Step Loss': loss_v.item(),
+                        'Loss/Train Loss': loss.avg,
                         'Process/Step': global_step,
                         'Process/Epoch': epoch
                     })
-                    
-                loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
+
+                loss.update(loss_v.item(), 1)
+                loss1.update(loss_v1.item(), 1)
+                loss2.update(loss_v2.item(), 1)
+                callback_logging(global_step, loss, loss1, loss2, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)
@@ -248,20 +266,19 @@ def main(args):
                 model = wandb.Artifact(artifact_name, type='model')
                 model.add_file(path_module)
                 wandb_logger.log_artifact(model)
-                
+
         if cfg.dali:
             train_loader.reset()
 
     if rank == 0:
         path_module = os.path.join(cfg.output, f"epoch_{epoch+1}.pt")
         torch.save(backbone.module.state_dict(), path_module)
-        
+
         if wandb_logger and cfg.save_artifacts:
             artifact_name = f"{run_name}_Final"
             model = wandb.Artifact(artifact_name, type='model')
             model.add_file(path_module)
             wandb_logger.log_artifact(model)
-
 
 
 if __name__ == "__main__":

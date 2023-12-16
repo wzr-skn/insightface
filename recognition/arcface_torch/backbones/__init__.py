@@ -1,5 +1,11 @@
 from .iresnet import iresnet18, iresnet34, iresnet50, iresnet100, iresnet200
 from .mobilefacenet import get_mbf
+from .mobileone import *
+from .flash import *
+from .efficientformer import *
+from .ghostnet_v1 import *
+from .mbo_efformer import *
+from .levit import *
 
 
 def get_model(name, **kwargs):
@@ -87,6 +93,101 @@ def get_model(name, **kwargs):
         return VisionTransformer(
             img_size=112, patch_size=9, num_classes=num_features, embed_dim=1024, depth=48,
             num_heads=8, drop_path_rate=0.1, norm_layer="ln", mask_ratio=0, using_checkpoint=True)
+
+    elif name == "mbo_s1":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_s1(fp16=fp16, num_features=num_features)
+
+    elif name == "mbo_s2":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_s2(fp16=fp16, num_features=num_features)
+
+    elif name == "mbo_s2_depth":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_s2_depth(fp16=fp16, num_features=num_features)
+
+    elif name == "mbo_s3":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_s3(fp16=fp16, num_features=num_features)
+
+    elif name == "mbo_s4":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_s4(fp16=fp16, num_features=num_features)
+
+    elif name == "mbo_s5":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_s5(fp16=fp16, num_features=num_features)
+
+    elif name == "ef_l3":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_ef_l3(fp16=fp16, num_features=num_features)
+
+    elif name == "ef_l3_shallow":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_ef_l3_shallow(fp16=fp16, num_features=num_features)
+
+    elif name == "ef_l3_gau":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_ef_l3_GAU(fp16=fp16, num_features=num_features)
+
+    elif name == "ef_l3_shallow_gau":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_ef_l3_shallow_GAU(fp16=fp16, num_features=num_features)
+
+    elif name == "ef_l3_shallow_gau_2b":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_ef_l3_shallow_GAU_2b(fp16=fp16, num_features=num_features)
+
+    elif name == "ef_l3_medium_gau":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_ef_l3_medium_GAU(fp16=fp16, num_features=num_features)
+
+    elif name == "ef_l7":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_ef_l7(fp16=fp16, num_features=num_features)
+
+    elif name == "gh_s0":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_gh_s0(fp16=fp16, num_features=num_features)
+
+    elif name == "gh_s1":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_gh_s1(fp16=fp16, num_features=num_features)
+
+    elif name == "mbo_ef_s1":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_efformer_s1(fp16=fp16, num_features=num_features)
+
+    elif name == "mbo_ef_s3":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbo_efformer_s3(fp16=fp16, num_features=num_features)
+
+    elif name == "levit_256":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_levit_256(fp16=fp16, num_features=num_features)
+
+    elif name == "levit_320":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_levit_320(fp16=fp16, num_features=num_features)
 
     else:
         raise ValueError()

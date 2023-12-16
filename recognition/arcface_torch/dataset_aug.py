@@ -2,8 +2,9 @@ import numbers
 import os
 import queue as Queue
 import threading
+import time
 from typing import Iterable
-
+import cv2
 import mxnet as mx
 import numpy as np
 import torch
@@ -18,17 +19,23 @@ from utils.utils_distributed_sampler import get_dist_info, worker_init_fn
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from insightface.app import MaskAugmentation
+from data_aug import *
+
 
 def get_dataloader(
-    root_dir,
-    local_rank,
-    batch_size,
-    dali = False,
-    dali_aug=False,
-    seed = 2048,
-    num_workers = 2,
-    ) -> Iterable:
-
+        root_dir,
+        local_rank,
+        batch_size,
+        dali=False,
+        dali_aug=False,
+        seed=2048,
+        num_workers=2,
+        aug_pipeline=None,
+        add_rec=None,
+        keep_max_yaw_val=None,
+        keep_max_pitch_val=None,
+        keep_max_yaw_and_pitch_val=None,
+) -> Iterable:
     rec = os.path.join(root_dir, 'train.rec')
     idx = os.path.join(root_dir, 'train.idx')
     train_set = None
@@ -40,16 +47,21 @@ def get_dataloader(
 
     # Mxnet RecordIO
     elif os.path.exists(rec) and os.path.exists(idx):
-        # train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
-        train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank, aug_modes='brightness=0.2+mask=0.1+blur=0.1')
+        train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank,
+                                  aug_pipeline=aug_pipeline,
+                                  add_rec=add_rec,
+                                  keep_max_yaw_val=keep_max_yaw_val,
+                                  keep_max_pitch_val=keep_max_pitch_val,
+                                  keep_max_yaw_and_pitch_val=keep_max_yaw_and_pitch_val,
+                                  )
 
     # Image Folder
     else:
         transform = transforms.Compose([
-             transforms.RandomHorizontalFlip(),
-             transforms.ToTensor(),
-             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-             ])
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
         train_set = ImageFolder(root_dir, transform)
 
     # DALI
@@ -80,6 +92,7 @@ def get_dataloader(
 
     return train_loader
 
+
 class BackgroundGenerator(threading.Thread):
     def __init__(self, generator, local_rank, max_prefetch=6):
         super(BackgroundGenerator, self).__init__()
@@ -106,6 +119,7 @@ class BackgroundGenerator(threading.Thread):
 
     def __iter__(self):
         return self
+
 
 class DataLoaderX(DataLoader):
 
@@ -138,63 +152,42 @@ class DataLoaderX(DataLoader):
 
 
 class MXFaceDataset(Dataset):
-    def __init__(self, root_dir, local_rank, aug_modes="brightness=0.1+mask=0.1"):
+    def __init__(self, root_dir, local_rank, aug_pipeline=None, add_rec=None, keep_max_yaw_val=None,
+                 keep_max_pitch_val=None, keep_max_yaw_and_pitch_val=None):
         super(MXFaceDataset, self).__init__()
-        default_aug_probs = {
-                'brightness' : 0.2,
-                'blur': 0.1,
-                'mask': 0.1,
-                }
 
-        aug_mode_list = aug_modes.lower().split('+')
-        aug_mode_map = {}
-        for aug_mode_str in aug_mode_list:
-            _aug = aug_mode_str.split('=')
-            aug_key = _aug[0]
-            if len(_aug)>1:
-                aug_prob = float(_aug[1])
+        if keep_max_yaw_val is not None:
+            assert isinstance(keep_max_yaw_val, (int, float)), 'add_yaw should be a int or a float'
+        if keep_max_pitch_val is not None:
+            assert isinstance(keep_max_pitch_val, (int, float)), 'add_pitch should be a int or a float'
+        if keep_max_yaw_and_pitch_val is not None:
+            assert isinstance(keep_max_yaw_and_pitch_val, (list, tuple)), 'add_yaw_pitch should be a list or a tuple'
+
+        if keep_max_yaw_and_pitch_val is not None:
+            if len(keep_max_yaw_and_pitch_val) == 1:
+                real_keep_max_yaw_and_pitch_val = [keep_max_yaw_and_pitch_val[0], keep_max_yaw_and_pitch_val[0]]
             else:
-                aug_prob = default_aug_probs[aug_key]
-            aug_mode_map[aug_key] = aug_prob
+                real_keep_max_yaw_and_pitch_val = keep_max_yaw_and_pitch_val
 
+        # read data augment method
+        aug_cls = {'MaskAugmentationAdd': MaskAugmentationAdd, 'CutOut': CutOut, 'GridMask': GridMask,
+                   'BlurByBlock': BlurByBlock, 'Enlight': Enlight, 'Shadow': Shadow, 'LightTransform': LightTransform}
         transform_list = []
-        self.mask_aug = False
-        self.mask_prob = 0.0
-        key = 'mask'
-        if key in aug_mode_map:
-            self.mask_aug = True
-            self.mask_prob = aug_mode_map[key]
-            transform_list.append(
-                MaskAugmentation(mask_names=['mask_white', 'mask_blue', 'mask_black', 'mask_green'], mask_probs=[0.4, 0.4, 0.1, 0.1], h_low=0.33, h_high=0.4, p=self.mask_prob)
-                )
-        if local_rank==0:
+        assert aug_pipeline is not None, f'aug_pipeline: {aug_pipeline} is none'
+        for aug_name, prop in aug_pipeline.items():
+            assert aug_name in aug_cls, f' not support {aug_name} in data aug'
+            transform_list.append(aug_cls[aug_name](**prop))
+
+        if local_rank == 0:
             print('data_transform_list:', transform_list)
-            print('mask:', self.mask_aug, self.mask_prob)
-        key = 'brightness'
-        if key in aug_mode_map:
-            prob = aug_mode_map[key]
-            transform_list.append(
-                A.RandomBrightnessContrast(brightness_limit=0.125, contrast_limit=0.05, p=prob)
-                )
-        key = 'blur'
-        if key in aug_mode_map:
-            prob = aug_mode_map[key]
-            transform_list.append(
-                A.ImageCompression(quality_lower=30, quality_upper=80, p=prob)
-                )
-            transform_list.append(
-                A.MedianBlur(blur_limit=(1,7), p=prob)
-                )
-            transform_list.append(
-                A.MotionBlur(blur_limit=(5,11), p=prob)
-                )
+
         transform_list += \
             [
                 A.HorizontalFlip(p=0.5),
                 A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
                 ToTensorV2(),
             ]
-        #here, the input for A transform is rgb cv2 img
+        # here, the input for A transform is rgb cv2 img
         self.transform = A.Compose(
             transform_list
         )
@@ -203,25 +196,57 @@ class MXFaceDataset(Dataset):
         path_imgrec = os.path.join(root_dir, 'train.rec')
         path_imgidx = os.path.join(root_dir, 'train.idx')
         self.imgrec = mx.recordio.MXIndexedRecordIO(path_imgidx, path_imgrec, 'r')
+
+        # add warp image rec path
+        self.imgidx_add = []
+        if add_rec is not None:
+            path_imgrec_add = os.path.join(add_rec, 'glint_part1.rec')
+            path_imgidx_add = os.path.join(add_rec, 'glint_part1.idx')
+            assert os.path.exists(path_imgidx_add), f'{path_imgidx_add} not exist'
+            assert os.path.exists(path_imgrec_add), f'{path_imgrec_add} not exist'
+            self.imgrec_add = mx.recordio.MXIndexedRecordIO(path_imgidx_add, path_imgrec_add, 'r')
+            imgidx_add_tmp = np.array(self.imgrec_add.keys)
+            start_time = time.time()
+            for idx in imgidx_add_tmp:
+                s = self.imgrec_add.read_idx(idx)
+                header, img = mx.recordio.unpack(s)
+                hlabel = header.label
+
+                warp_pitch, warp_yaw, warp_roll = hlabel[-3:] * 180 / np.pi
+                flag = (keep_max_yaw_val and warp_yaw > keep_max_yaw_val and warp_pitch == 0) or \
+                       (keep_max_pitch_val and warp_yaw == 0 and warp_pitch > keep_max_pitch_val) or \
+                       (keep_max_yaw_and_pitch_val and warp_yaw > real_keep_max_yaw_and_pitch_val[0] and
+                        warp_pitch > real_keep_max_yaw_and_pitch_val[1])
+                if not flag:
+                    self.imgidx_add.append(idx)
+            print(f'for loop strip consume time: {time.time() - start_time}')
+
         s = self.imgrec.read_idx(0)
         header, _ = mx.recordio.unpack(s)
-        #print(header)
-        #print(len(self.imgrec.keys))
+        # print(header)
+        # print(len(self.imgrec.keys))
         if header.flag > 0:
-            if len(header.label)==2:
+            if len(header.label) == 2:
                 self.imgidx = np.array(range(1, int(header.label[0])))
             else:
                 self.imgidx = np.array(list(self.imgrec.keys))
         else:
             self.imgidx = np.array(list(self.imgrec.keys))
-        #print('imgidx len:', len(self.imgidx))
+        # print('imgidx len:', len(self.imgidx))
 
     def __getitem__(self, index):
-        idx = self.imgidx[index]
-        s = self.imgrec.read_idx(idx)
+        # get img by idx
+        if index < len(self.imgidx):
+            real_idx = self.imgidx[index]
+            s = self.imgrec.read_idx(real_idx)
+        else:
+            index = index - len(self.imgidx)
+            real_idx = self.imgidx_add[index]
+            s = self.imgrec_add.read_idx(real_idx)
+
         header, img = mx.recordio.unpack(s)
         hlabel = header.label
-        #print('hlabel:', hlabel.__class__)
+        # print('hlabel:', hlabel.__class__)
         sample = mx.image.imdecode(img).asnumpy()
         if not isinstance(hlabel, numbers.Number):
             idlabel = hlabel[0]
@@ -237,7 +262,7 @@ class MXFaceDataset(Dataset):
         return sample, label
 
     def __len__(self):
-        return len(self.imgidx)
+        return len(self.imgidx) + len(self.imgidx_add)
 
 
 class SyntheticDataset(Dataset):
@@ -258,11 +283,11 @@ class SyntheticDataset(Dataset):
 
 
 def dali_data_iter(
-    batch_size: int, rec_file: str, idx_file: str, num_threads: int,
-    initial_fill=32768, random_shuffle=True,
-    prefetch_queue_depth=1, local_rank=0, name="reader",
-    mean=(127.5, 127.5, 127.5), 
-    std=(127.5, 127.5, 127.5)):
+        batch_size: int, rec_file: str, idx_file: str, num_threads: int,
+        initial_fill=32768, random_shuffle=True,
+        prefetch_queue_depth=1, local_rank=0, name="reader",
+        mean=(127.5, 127.5, 127.5),
+        std=(127.5, 127.5, 127.5)):
     """
     Parameters:
     ----------
@@ -283,7 +308,7 @@ def dali_data_iter(
     condition_flip = fn.random.coin_flip(probability=0.5)
     with pipe:
         jpegs, labels = fn.readers.mxnet(
-            path=rec_file, index_path=idx_file, initial_fill=initial_fill, 
+            path=rec_file, index_path=idx_file, initial_fill=initial_fill,
             num_shards=world_size, shard_id=rank,
             random_shuffle=random_shuffle, pad_last_batch=False, name=name)
         images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
